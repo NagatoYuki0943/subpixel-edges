@@ -1,501 +1,974 @@
 import numpy as np
 from numba import njit
-
 from subpixel_edges.circle import circle_horizontal_window, circle_vertical_window
 
 
-# @njit(cache=True)
-def h_edges(F, G, rows, Gx, Gy, w, edges, order, threshold, x, y, cols,  I, C):
-    FF = F.transpose().ravel()
-    GG = G.transpose().ravel()
+@njit(cache=True)
+def h_edges(
+    image: np.ndarray,  # 原始图像                                            [30, 30]
+    image_flatten: np.ndarray,  # 展平的原始图像, ravel("F") 展平的图像          [900]
+    image_smooth_flatten: np.ndarray,  # 展平的模糊图像, ravel("F") 展平的图像   [900]
+    Gx: np.ndarray,  # 图像在 x 方向上的梯度分量                                 [900]
+    Gy: np.ndarray,  # 图像在 y 方向上的梯度分量                                 [900]
+    x: np.ndarray,  # 图像在 x 方向上的索引                                     [900]
+    y: np.ndarray,  # 图像在 y 方向上的索引                                     [900]
+    edges: np.ndarray,  # 一维数组，包含检测到的边缘点的索引                       [24]
+    rows: int,  # 图像的行数                                                   30
+    order: int,  # 指定多项式的阶数，用于拟合边缘
+    # 调节平滑程度: w 的值用于调节图像处理中平滑操作的强度。较高的 w 值通常意味着在平滑过程中给予中心像素更大的权重，从而在边缘检测中帮助更明晰地识别边缘。
+    # 影响梯度计算：在进行梯度计算时，w 可以用来平衡当前像素与其邻域像素的影响，以提高检测精度。
+    w: float,
+    threshold: int | float,  # 梯度阈值, 用于判断是否为边缘点
+    max_valid_offset: int,  # 亚像素允许最大偏移值
+    intensity_image: np.ndarray,  # 强度图像, 每个像素值表示每个像素的强度的累积总和 [30, 30]
+    counter: np.ndarray,  # 计数图像, 每个像素值表示包括该像素的子图像的数量         [30, 30]
+):
+    n_edges = edges.shape[0]  # 24
 
-    n_edges = np.shape(edges)[0]
+    A = np.zeros(n_edges,)  # [24]
+    B = np.zeros(n_edges,)  # [24]
+    a = np.zeros(n_edges,)  # [24]
+    b = np.zeros(n_edges,)  # [24]
+    c = np.zeros(n_edges,)  # [24]
+    nx = np.zeros(n_edges)  # [24]
+    ny = np.zeros(n_edges)  # [24]
+    curv = np.zeros(n_edges)  # [24]
 
-    A = np.zeros((n_edges, 1))
-    B = np.zeros((n_edges, 1))
-    a = np.zeros((n_edges, 1))
-    b = np.zeros((n_edges, 1))
-    c = np.zeros((n_edges, 1))
-    nx = np.zeros((n_edges, 1))
-    ny = np.zeros((n_edges, 1))
-    curv = np.zeros((n_edges, 1))
+    valid = np.full(n_edges, False)  # [24]
 
-
-    valid = np.full((n_edges, 1), False)
-
+    # circle_vertical_window 分辨率
     pixel_grid_resol = 50
 
     for k in range(n_edges):
         edge = edges[k]
+
+        # m: 这个参数是一个符号变量, 用于指示边缘的梯度方向
+        #   如果 Gx[edge] * Gy[edge] >= 0 表示 Gx 和 Gy 同号, m 被设为 1; 如果异号, m 被设为 -1.
+
+        # compute window floating limits
+        # m1, m2, l1, l2, r1, r2 在 5.1 章
+        # m1, m2, min_m1, max_m2: 这些参数定义了在边缘点垂直方向（沿着边缘方向）搜索的边界
+        #   m1 和 m2 是沿边缘方向的起始点和结束点. 它们用于找到垂直于边缘的最强梯度变化
+        #   min_m1 是 m1 的最小值限制
+        #   max_m2 是 m2 的最大值限制
+
+        # l1, l2, min_l1, max_l2: 这些参数定义了在边缘点左侧（沿着边缘方向）搜索的边界
+        #   l1 和 l2 是沿边缘方向的起始点和结束点. 它们用于找到垂直于边缘的最强梯度变化
+        #   min_l1 是 l1 的最小值限制
+        #   max_l2 是 l2 的最大值限制
+
+        # r1, r2, min_r1, max_r2: 这些参数定义了在边缘点右侧（沿着边缘方向）搜索的边界
+        #   r1 和 r2 是沿边缘方向的起始点和结束点. 它们用于找到垂直于边缘的最强梯度变化
+        #   min_r1 是 r1 的最小值限制
+        #   max_r2 是 r2 的最大值限制
         m1 = -1
         m2 = 1
+        min_m1 = -4
+        max_m2 = 4
+        # 根据 Gx 和 Gy 的乘积（表示梯度的方向）调整边界变量, 乘积是否大于0代表直线的方向
+        # ↖️⬆️↗️  上下左右方向代表 Gx Gy,假设 Gx >= 0 为朝右, Gy >= 0 朝上
+        # ⬅️  ➡️  则右上方向和左下方向代表斜率 >= 0, Gx * Gy >= 0
+        # ↙️⬇️↘️  则左上方向和右下方向代表斜率 < 0, Gx * Gy < 0
+        # 下面 2 种方式是 l 和 r 左右颠倒
         if Gx[edge] * Gy[edge] >= 0:
             m = 1
+
             l1 = -1
-            r2 = 1
-            min_l1 = -3
-            max_r2 = 3
             l2 = 1
-            r1 = -1
+            min_l1 = -3
             max_l2 = 4
+
+            r1 = -1
+            r2 = 1
             min_r1 = -4
+            max_r2 = 3
         else:
             m = -1
-            l1 = -1
-            r2 = 1
-            min_l1 = -4
-            max_r2 = 4
-            l2 = 1
-            r1 = -1
-            max_l2 = 3
-            min_r1 = -3
 
-        while l1 > min_l1 and np.abs(Gy[edge - rows + l1]) >= np.abs(Gy[edge - rows + l1 - 1]):
+            l1 = -1
+            l2 = 1
+            min_l1 = -4
+            max_l2 = 3
+
+            r1 = -1
+            r2 = 1
+            min_r1 = -3
+            max_r2 = 4
+
+        # 通过 while 循环确定边界索引 l1, l2, m1, m2, r1 和 r2, 这些索引定义了用于计算边缘点系数的像素范围
+        # 找范围内的梯度最小值
+        while l1 > min_l1 and np.abs(Gy[edge - rows + l1]) >= np.abs(
+            Gy[edge - rows + l1 - 1]
+        ):
             l1 -= 1
 
-        while l2 < max_l2 and np.abs(Gy[edge - rows + l2]) >= np.abs(Gy[edge - rows + l2 + 1]):
+        while l2 < max_l2 and np.abs(Gy[edge - rows + l2]) >= np.abs(
+            Gy[edge - rows + l2 + 1]
+        ):
             l2 += 1
 
-        while m1 > -4 and np.abs(Gy[edge + m1]) >= np.abs(Gy[edge + m1 - 1]):
+        while m1 > min_m1 and np.abs(Gy[edge + m1]) >= np.abs(Gy[edge + m1 - 1]):
             m1 -= 1
 
-        while m2 < 4 and np.abs(Gy[edge + m2]) >= np.abs(Gy[edge + m2 + 1]):
+        while m2 < max_m2 and np.abs(Gy[edge + m2]) >= np.abs(Gy[edge + m2 + 1]):
             m2 += 1
 
-        while r1 > min_r1 and np.abs(Gy[edge + rows + r1]) >= np.abs(Gy[edge + rows + r1 - 1]):
+        while r1 > min_r1 and np.abs(Gy[edge + rows + r1]) >= np.abs(
+            Gy[edge + rows + r1 - 1]
+        ):
             r1 -= 1
 
-        while r2 < max_r2 and np.abs(Gy[edge + rows + r2]) >= np.abs(Gy[edge + rows + r2 + 1]):
+        while r2 < max_r2 and np.abs(Gy[edge + rows + r2]) >= np.abs(
+            Gy[edge + rows + r2 + 1]
+        ):
             r2 += 1
 
+        # window 权重: 为了加速恢复过程，合成子图像中的中间列使用更高的权重
         window = np.zeros((9, 3))
-        window[l1 + 5 - 1:l2 + 5, 0] = 1
-        window[m1 + 5 - 1:m2 + 5, 1] = 100
-        window[r1 + 5 - 1:r2 + 5, 2] = 1
+        window[l1 + 5 - 1 : l2 + 5, 0] = 1
+        window[m1 + 5 - 1 : m2 + 5, 1] = 100
+        window[r1 + 5 - 1 : r2 + 5, 2] = 1
 
         if m > 0:
-            AA = (GG[edge + m2] + GG[edge + rows + r2]) / 2
-            BB = (GG[edge - rows + l1] + GG[edge + m1]) / 2
+            # (下侧 + 右边一列的下侧) / 2 **
+            # (上侧 + 左边一列的上侧) / 2  **
+            AA = (
+                image_smooth_flatten[edge + m2] + image_smooth_flatten[edge + rows + r2]
+            ) / 2
+            BB = (
+                image_smooth_flatten[edge + m1] + image_smooth_flatten[edge - rows + l1]
+            ) / 2
         else:
-            AA = (GG[edge - rows + l2] + GG[edge + m2]) / 2
-            BB = (GG[edge + m1] + GG[edge + rows + r1]) / 2
+            # (下侧 + 左边一列的下侧) / 2  **
+            # (上侧 + 右边一列的上侧) / 2 **
+            AA = (
+                image_smooth_flatten[edge + m2] + image_smooth_flatten[edge - rows + l2]
+            ) / 2
+            BB = (
+                image_smooth_flatten[edge + m1] + image_smooth_flatten[edge + rows + r1]
+            ) / 2
 
         # search for a second close edge
         u_border = False
         d_border = False
 
-        if m1 > -4:
-            partial = np.abs(GG[edge + m1 - 2])
-            if partial > np.abs(GG[edge] / 4) and partial > threshold / 2:
+        # 如果不到范围极限就判断上侧是否有第二条边
+        if m1 > min_m1:
+            # 导数值在到达极限(最小)后突然升高就认为有第二条边
+            # 边界外的梯度
+            part = np.abs(Gy[edge + m1 - 2])  # 边界外的梯度
+            # 判断边界外的梯度是否突然升高
+            if (
+                part > np.abs(Gy[edge] / 4) and part > threshold / 2
+            ):
                 u_border = True
 
-        if m2 < 4:
-            partial = np.abs(GG[edge + m2 + 2])
-            if partial > np.abs(GG[edge] / 4) and partial > threshold / 2:
+        # 如果不到范围极限就判断下侧是否有第二条边
+        if m2 < max_m2:
+            # 导数值在到达极限(最小)后突然升高就认为有第二条边
+            # 边界外的梯度
+            part = np.abs(Gy[edge + m2 + 2])  # 边界外的梯度
+            # 判断边界外的梯度是否突然升高
+            if (
+                part > np.abs(Gy[edge] / 4) and part > threshold / 2
+            ):
                 d_border = True
 
         SL = 0
         SM = 0
         SR = 0
-        j = np.int(np.floor((edges[k] - 1) / rows) + 1) 
-        i = np.int(edges[k] - rows * (j-1 )) + 1 
+
+        # 边缘像素中心
+        j = np.int64(np.floor((edge - 1) / rows) + 1)  # w
+        i = np.int64(edge - rows * (j - 1)) + 1  # h
 
         if u_border or d_border:
-            rimvt = np.copy(F[i - 5 - 1:i + 5, j - 2 - 1:j + 2])
+            # 提取子图 [11, 5]
+            rimvt = np.copy(image[i - 6 : i + 5, j - 3 : j + 2])
+
             if u_border:
+                # 使用的原始图像, 而不是模糊后的图像
                 if m > 0:
-                    BB = (FF[edge + m1] + FF[edge - rows + l1]) / 2
+                    # (上侧 + 左边一列的上侧) / 2
+                    BB = (
+                        image_flatten[edge + m1] + image_flatten[edge - rows + l1]
+                    ) / 2
                     p = 1
                 else:
-                    BB = (FF[edge + m1] + FF[edge + rows + r1]) / 2
+                    # (上侧 + 右边一列的上侧) / 2
+                    BB = (
+                        image_flatten[edge + m1] + image_flatten[edge + rows + r1]
+                    ) / 2
                     p = 0
 
+                # ll 是 l1 l2 左边的一列
                 if Gy[edge - 2 * rows + l1 + p] * Gy[edge] > 0:
                     ll = l1 + p - 1
                 else:
                     ll = l1 + p
 
+                # rr 是 r1 r2 右边的一列
                 if Gy[edge + 2 * rows + r1 + 1 - p] * Gy[edge] > 0:
                     rr = r1 - p
                 else:
-                    rr = r1 + 1 - p
+                    rr = r1 - p + 1
 
-                rimvt[0:ll + 6, 0] = BB
-                rimvt[0:l1 + 6, 1] = BB
-                rimvt[0:m1 + 6, 2] = BB
-                rimvt[0:r1 + 6, 3] = BB
-                rimvt[0:rr + 6, 4] = BB
+                # 将子图上方像素全变为 BB
+                rimvt[0 : ll + 6, 0] = BB
+                rimvt[0 : l1 + 6, 1] = BB
+                rimvt[0 : m1 + 6, 2] = BB
+                rimvt[0 : r1 + 6, 3] = BB
+                rimvt[0 : rr + 6, 4] = BB
+
+                # l1 m1 r1 上移
                 l1 = -3 + m
                 m1 = -3
                 r1 = -3 - m
 
             if d_border:
+                # 使用的原始图像, 而不是模糊后的图像
                 if m > 0:
-                    AA = (FF[edge + m2] + FF[edge + rows + r2]) / 2
+                    # (下侧 + 右边一列的下侧) / 2
+                    AA = (
+                        image_flatten[edge + m2] + image_flatten[edge + rows + r2]
+                    ) / 2
                     p = 1
                 else:
-                    AA = (FF[edge + m2] + FF[edge - rows + l2]) / 2
+                    # (下侧 + 左边一列的下侧) / 2
+                    AA = (
+                        image_flatten[edge + m2] + image_flatten[edge - rows + l2]
+                    ) / 2
                     p = 0
 
+                # ll 是 l1 l2 左边的一列
                 if Gy[edge - 2 * rows + l2 + p - 1] * Gy[edge] > 0:
                     ll = l2 + p
                 else:
                     ll = l2 + p - 1
 
+                # rr 是 r1 r2 右边的一列
                 if Gy[edge + 2 * rows + r2 - p] * Gy[edge] > 0:
-                    rr = r2 + 1 - p
+                    rr = r2 - p + 1
                 else:
                     rr = r2 - p
 
-                rimvt[ll + 5:11, 0] = AA
-                rimvt[l2 + 5:11, 1] = AA
-                rimvt[m2 + 5:11, 2] = AA
-                rimvt[r2 + 5:11, 3] = AA
-                rimvt[rr + 5:11, 4] = AA 
+                # 将子图下方像素全变为 AA
+                rimvt[ll + 5 : 11, 0] = AA
+                rimvt[l2 + 5 : 11, 1] = AA
+                rimvt[m2 + 5 : 11, 2] = AA
+                rimvt[r2 + 5 : 11, 3] = AA
+                rimvt[rr + 5 : 11, 4] = AA
 
+                # l2 m2 r2 下移
                 l2 = 3 + m
                 m2 = 3
                 r2 = 3 - m
 
-            rimv2 = (rimvt[0:9, 0:3] + rimvt[0:9, 1:4] + rimvt[0:9, 2:5] + \
-                     rimvt[1:10, 0:3] + rimvt[1:10, 1:4] + rimvt[1:10, 2:5] + \
-                     rimvt[2:11, 0:3] + rimvt[2:11, 1:4] + rimvt[2:11, 2:5]) / 9
+            # 对子图像 F' 进行平滑处理以获得子图像 G'
+            # 生成子图2 [11, 5] -> [9, 3], 使用 [9, 3] 的滑动窗口在子图中取值, 然后取均值
+            rimv2 = (
+                rimvt[0:9, 0:3]
+                + rimvt[0:9, 1:4]
+                + rimvt[0:9, 2:5]
+                + rimvt[1:10, 0:3]
+                + rimvt[1:10, 1:4]
+                + rimvt[1:10, 2:5]
+                + rimvt[2:11, 0:3]
+                + rimvt[2:11, 1:4]
+                + rimvt[2:11, 2:5]
+            ) / 9
 
+            # 使用子图2计算 SL SM SR
             for n in range(l1 + 5 - 1, l2 + 5):
-                SL = SL + rimv2[n, 0]
+                SL += rimv2[n, 0]
             for n in range(m1 + 5 - 1, m2 + 5):
-                SM = SM + rimv2[n, 1]
+                SM += rimv2[n, 1]
             for n in range(r1 + 5 - 1, r2 + 5):
-                SR = SR + rimv2[n, 2]
+                SR += rimv2[n, 2]
         else:
+            # 累加像素值,强度求和
+            # 左侧
             for n in range(l1, l2 + 1):
-                SL = SL + GG[edge - rows + n]
+                SL += image_smooth_flatten[edge - rows + n]
+            # 中间
             for n in range(m1, m2 + 1):
-                SM = SM + GG[edge + n]
+                SM += image_smooth_flatten[edge + n]
+            # 右侧
             for n in range(r1, r2 + 1):
-                SR = SR + GG[edge + rows + n]
+                SR += image_smooth_flatten[edge + rows + n]
 
-        # compute edge features
+        # 分母
         den = 2 * (AA - BB)
+
+        # 根据 order 和分母 den 的值计算多项式系数 c, b 和 a
+        #  y = a + b * x + c * x^2
+        # 公式多的部分在 5.1 章
         if order == 2:
+            # 二阶多项式
             if den != 0:
-                c[k] = np.divide(SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1), den)
+                c[k] = (
+                    SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1)
+                ) / den
         else:
+            # 一阶多项式
             c[k] = 0
 
         if den != 0:
-            a[k] = np.divide(2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1), den) - w * c[k]
-            if np.abs(a[k]).item() > 1:
+            # a 和位置偏移有关
+            a[k] = (2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1)) / den - w * c[k]
+
+            # 偏移最大距离
+            if np.abs(a[k].item()) > max_valid_offset:
                 valid[k] = False
                 continue
-
             valid[k] = True
-            b[k] = np.divide(SR - SL + AA * (l2 - r2) - BB * (l1 - r1), den)
-            A[k] = AA
-            B[k] = BB
-            s = np.sign(AA - BB)
-            nx[k] = s / np.sqrt(1 + b[k] ** 2) * b[k]
-            ny[k] = s / np.sqrt(1 + b[k] ** 2)
+
+            b[k] = (SR - SL + AA * (l2 - r2) - BB * (l1 - r1)) / den
+
+            nx[k] = np.sign(AA - BB) / np.sqrt(1 + b[k] ** 2) * b[k]
+            ny[k] = np.sign(AA - BB) / np.sqrt(1 + b[k] ** 2)
+
             curv[k] = 2 * c[k] / ((1 + b[k] ** 2) ** 1.5)
-
             if Gy[edge] < 0:
-                curv[k] = -curv[k]
+                curv[k] = -curv[k]  # 梯度方向相反
 
-            # generate circle subimage
-            if curv[k, 0].item() != 0:
-                R = np.abs(1 / curv[k, 0].item())
+        # 计算得到的 AA BB 存储到 A 和 B 数组中
+        A[k] = AA
+        B[k] = BB
 
-            RG = float(10000)
-            RL = float(4.5)
+        # --------------------各向异性过滤--------------------#
+        radius = 0  # prevent not associated
+        # generate circle subimage
+        if curv[k].item() != 0:
+            # 曲率半径 = 1 / 曲率
+            radius = np.abs(1 / curv[k].item())
 
-            if R > RG:
-                R = RG
-            if R < RL:
-                R = RL
-            if curv[k].item() > 0:
-                s = -1
-                inner_intensity = min(AA, BB)
-                outer_intensity = max(AA, BB)
-            else:
-                s = 1
-                inner_intensity = max(AA, BB)
-                outer_intensity = min(AA, BB)
+        if radius > 1e4:
+            radius = 1e4
 
-        center = ([x[edge]+1 + s * R * nx[k], y[edge]+1 - a[k] + s * R * ny[k]])
-        subimage = circle_vertical_window(j, i, center[0], center[1], R, inner_intensity, outer_intensity,
-                                          pixel_grid_resol)
+        if radius < 4.5:
+            radius = 4.5
 
-        # update counter and intensity images
-        I[i-4-1:i+4,j-1-1:j+1] = I[i-4-1:i+4,j-1-1:j+1] + window*subimage
-        C[i-4-1:i+4,j-1-1:j+1] = C[i-4-1:i+4,j-1-1:j+1] + window
+        if curv[k].item() > 0:
+            s = -1
+            inner_intensity = min(AA, BB)
+            outer_intensity = max(AA, BB)
+        else:
+            s = 1
+            inner_intensity = max(AA, BB)
+            outer_intensity = min(AA, BB)
+
+        # 计算圆的中心
+        center = [
+            (x[edge] + 1 + s * radius * nx[k]).item(),
+            (y[edge] + 1 - a[k] + s * radius * ny[k]).item(),
+        ]
+        # 在检测到边缘的像素处，使用获得的特征值（子像素位置、方向、曲率和两侧强度变化）生成包含完美边缘的恢复子图像 [9, 3]
+        subimage = circle_vertical_window(
+            j,  # 边缘像素中心 x
+            i,  # 边缘像素中心 y
+            center[0],  # 圆的中心 x 坐标
+            center[1],  # 圆的中心 y 坐标
+            radius,  # 圆的半径
+            inner_intensity,
+            outer_intensity,
+            pixel_grid_resol,
+        )
+
+        # update counter and intensity images [9, 3]
+        # 强度图像, 每个像素值表示每个像素的强度的累积总和, 存储 window 权重 * 子图
+        # window 和 subimage 形状相同
+        intensity_image[i - 5 : i + 4, j - 2 : j + 1] += window * subimage
+        # 计数图像, 每个像素值表示包括该像素的子图像的数量, 存储 window 权重
+        counter[i - 5 : i + 4, j - 2 : j + 1] += window
+        # --------------------各向异性过滤--------------------#
 
     # remove invalid values
-    valid = valid.reshape((-1,))
-
     edges = edges[valid]
     A = A[valid]
     B = B[valid]
     a = a[valid]
     b = b[valid]
     c = c[valid]
-    nx = nx[valid].reshape((-1,))
-    ny = ny[valid].reshape((-1,))
 
+    # nx 和 ny
+    # 含义：这两个数组组成了一个单位法向量，即在边缘处的“法向”（或称垂直方向）。
+    # 计算过程：
+    #     – 程序先通过比较边缘两侧的平均强度（A 与 B）确定边缘方向的“极性”，用 np.sign(A-B) 得到正负信息。
+    #     – 同时，利用参数 b（拟合多项式 y = a + b*x 得到的一阶项，即局部斜率）计算了归一化因子 1/√(1+b²) 。
+    #     – 最终，nx 按公式 nx = np.sign(A-B)·b/√(1+b²) 得到，而 ny = np.sign(A-B)/√(1+b²) 。
+    # 几何意义：
+    #     – 如果设拟合曲线的局部斜率为 tanθ，则 ny 对应 cosθ 而 nx 对应 sinθ（外加一个与边缘强度变化方向有关的符号）。
+    #     – 这样得到 (nx, ny) 就是指向边缘“正面”（通常由暗侧指向亮侧）的单位法向量，可用于后续的边缘精细定位或形状分析。
+    nx = nx[valid]
+    ny = ny[valid]
+
+    # 像素边缘坐标
+    pixel_x = x[edges]
+    pixel_y = y[edges]
+
+    # 亚像素边缘坐标, x 方向为像素坐标, y 方向为亚像素坐标
     x = x[edges]
-    y = y[edges] - a.transpose().ravel()
+    y = y[edges] - a
 
-    curv = curv[valid].reshape((-1,))
+    # curv (边缘曲率)
+    # 含义：curv 表示边缘在亚像素层面处的曲率，即描述边缘弯曲程度和方向的一个量。
+    # 计算过程：
+    #     – 在拟合局部灰度变化时，若 order==2，则通过二阶多项式拟合 (即 y = a + b·x + c·x²) 得到二阶系数 c。
+    #     – 标准二阶曲线的曲率公式为 2·c/(1+b²)^(3/2) ，这里程序中又乘上了 nn ，nn 根据 Gy 的正负（梯度 y 分量）调整符号，使得曲率的正负方向与梯度方向相一致。
+    # 几何意义：
+    #     – curv 的数值表示边缘局部弯曲的程度：绝对值越大说明弯曲越明显；正负则指示边缘向哪一侧弯曲。
+    #     – 若 order 为 1（二阶项为 0），则 curv 归零，表明边缘局部近似直线。
+    curv = curv[valid]
 
-    i0 = np.minimum(A, B).reshape((-1,))
-    i1 = np.maximum(A, B).reshape((-1,))
+    # i0 和 i1
+    # 含义：这两个值描述边缘两侧的平均灰度值。
+    # 计算过程：
+    #     – A 与 B 分别是通过在边缘点两侧（由 m1, m2, l1, l2, r1, r2 所限定的像素区域）对图像像素灰度进行加权或平均得到的。
+    #     – 为了区分边缘的暗侧和亮侧，通过 np.minimum(A, B) 得到 i0（较暗的一侧），而 np.maximum(A, B) 得到 i1（较亮的一侧）。
+    # 意义与应用：
+    #     – i0 和 i1 为后续边缘分析（例如边缘分类、阈值选择或进一步精细定位）提供了边缘两侧的灰度信息。
+    #     – 边缘由灰度的突变引起，i0 与 i1 的差异往往决定了边缘的对比度及检测的鲁棒性。
+    i0 = np.minimum(A, B)
+    i1 = np.maximum(A, B)
 
-    return x, y, edges, nx, ny, i0, i1, curv, I, C, G
+    # edges, pixel_x, pixel_y, x, y, nx, ny, curv, i0, i1 all shape: [28]
+    # intensity_image, counter all shape: [30, 30]
+    return edges, pixel_x, pixel_y, x, y, nx, ny, curv, i0, i1, intensity_image, counter
 
 
-# @njit(cache=True)
-def v_edges(F, G, rows, Gx, Gy, w, edges, order, threshold, x, y, I, C):
-    n_edges = np.shape(edges)[0]
+@njit(cache=True)
+def v_edges(
+    image: np.ndarray,  # 原始图像                                            [30, 30]
+    image_flatten: np.ndarray,  # 展平的原始图像, ravel("F") 展平的图像          [900]
+    image_smooth_flatten: np.ndarray,  # 展平的模糊图像, ravel("F") 展平的图像   [900]
+    Gx: np.ndarray,  # 图像在 x 方向上的梯度分量                                 [900]
+    Gy: np.ndarray,  # 图像在 y 方向上的梯度分量                                 [900]
+    x: np.ndarray,  # 图像在 x 方向上的索引                                     [900]
+    y: np.ndarray,  # 图像在 y 方向上的索引                                     [900]
+    edges: np.ndarray,  # 一维数组，包含检测到的边缘点的索引                       [28]
+    rows: int,  # 图像的行数                                                   30
+    order: int,  # 指定多项式的阶数，用于拟合边缘
+    # 调节平滑程度: w 的值用于调节图像处理中平滑操作的强度。较高的 w 值通常意味着在平滑过程中给予中心像素更大的权重，从而在边缘检测中帮助更明晰地识别边缘。
+    # 影响梯度计算：在进行梯度计算时，w 可以用来平衡当前像素与其邻域像素的影响，以提高检测精度。
+    w: float,
+    threshold: int | float,  # 梯度阈值, 用于判断是否为边缘点
+    max_valid_offset: int,  # 亚像素允许最大偏移值
+    intensity_image: np.ndarray,  # 强度图像, 每个像素值表示每个像素的强度的累积总和 [30, 30]
+    counter: np.ndarray,  # 计数图像, 每个像素值表示包括该像素的子图像的数量         [30, 30]
+):
+    n_edges = edges.shape[0]  # 28
 
-    A = np.zeros((n_edges, 1))
-    B = np.zeros((n_edges, 1))
-    a = np.zeros((n_edges, 1))
-    b = np.zeros((n_edges, 1))
-    c = np.zeros((n_edges, 1))
-    nx = np.zeros((n_edges, 1))
-    ny = np.zeros((n_edges, 1))
-    curv = np.zeros((n_edges, 1))
+    A = np.zeros(n_edges)  # [28]
+    B = np.zeros(n_edges)  # [28]
+    a = np.zeros(n_edges)  # [28]
+    b = np.zeros(n_edges)  # [28]
+    c = np.zeros(n_edges)  # [28]
+    nx = np.zeros(n_edges)  # [28]
+    ny = np.zeros(n_edges)  # [28]
+    curv = np.zeros(n_edges)  # [28]
 
-    FF = F.transpose().ravel()
-    GG = G.transpose().ravel()
+    valid = np.full(n_edges, False)  # [28]
 
-    valid = np.full((n_edges, 1), False)
-
+    # circle_horizontal_window 分辨率
     pixelGridResol = 50
 
     # compute all vertical edges
     for k in range(n_edges):
         edge = edges[k]
 
+        # m: 这个参数是一个符号变量, 用于指示边缘的梯度方向
+        #   如果 Gx[edge] * Gy[edge] >= 0 表示 Gx 和 Gy 同号, m 被设为 1; 如果异号, m 被设为 -1.
+
         # compute window floating limits
+        # m1, m2, l1, l2, r1, r2 在 5.1 章
+        # m1, m2, min_m1, max_m2: 这些参数定义了在边缘点水平方向（沿着边缘方向）搜索的边界
+        #   m1 和 m2 是沿边缘方向的起始点和结束点. 它们用于找到水平于边缘的最强梯度变化
+        #   min_m1 是 m1 的最小值限制
+        #   max_m2 是 m2 的最大值限制
+
+        # l1, l2, min_l1, max_l2: 这些参数定义了在边缘点上侧（沿着边缘方向）搜索的边界
+        #   l1 和 l2 是沿边缘方向的起始点和结束点. 它们用于找到垂直于边缘的最强梯度变化
+        #   min_l1 是 l1 的最小值限制
+        #   max_l2 是 l2 的最大值限制
+
+        # r1, r2, min_r1, max_r2: 这些参数定义了在边缘点下侧（沿着边缘方向）搜索的边界
+        #   r1 和 r2 是沿边缘方向的起始点和结束点. 它们用于找到垂直于边缘的最强梯度变化
+        #   min_r1 是 r1 的最小值限制
+        #   max_r2 是 r2 的最大值限制
         m1 = -1
         m2 = 1
-
+        min_m1 = -4
+        max_m2 = 4
+        # 根据 Gx 和 Gy 的乘积（表示梯度的方向）调整边界变量, 乘积是否大于0代表直线的方向
+        # ↖️⬆️↗️  上下左右方向代表 Gx Gy,假设 Gx >= 0 为朝右, Gy >= 0 朝上
+        # ⬅️  ➡️  则右上方向和左下方向代表斜率 >= 0, Gx * Gy >= 0
+        # ↙️⬇️↘️  则左上方向和右下方向代表斜率 < 0, Gx * Gy < 0
+        # 下面 2 种方式是 l 和 r 左右颠倒
         if Gx[edge] * Gy[edge] >= 0:
             m = 1
+
             l1 = -1
-            r2 = 1
-            min_l1 = -3
-            max_r2 = 3
             l2 = 1
-            r1 = -1
+            min_l1 = -3
             max_l2 = 4
+
+            r1 = -1
+            r2 = 1
             min_r1 = -4
+            max_r2 = 3
         else:
             m = -1
+
             l1 = -1
-            r2 = 1
-            min_l1 = -4
-            max_r2 = 4
             l2 = 1
-            r1 = -1
+            min_l1 = -4
             max_l2 = 3
+
+            r1 = -1
+            r2 = 1
             min_r1 = -3
+            max_r2 = 4
 
-        while l1 > min_l1 and np.abs(Gx[edge - 1 + l1 * rows]) >= np.abs(Gx[edge - 1 + (l1 - 1) * rows]):
-            l1 = l1 - 1
+        # 通过 while 循环确定边界索引 l1, l2, m1, m2, r1 和 r2, 这些索引定义了用于计算边缘点系数的像素范围
+        # 找范围内的梯度最小值
+        while l1 > min_l1 and np.abs(Gx[edge + l1 * rows - 1]) >= np.abs(
+            Gx[edge + (l1 - 1) * rows - 1]
+        ):
+            l1 -= 1
 
-        while l2 < max_l2 and np.abs(Gx[edge - 1 + l2 * rows]) >= np.abs(Gx[edge - 1 + (l2 + 1) * rows]):
-            l2 = l2 + 1
+        while l2 < max_l2 and np.abs(Gx[edge + l2 * rows - 1]) >= np.abs(
+            Gx[edge + (l2 + 1) * rows - 1]
+        ):
+            l2 += 1
 
-        while m1 > -4 and np.abs(Gx[edge + m1 * rows]) >= np.abs(Gx[edge + (m1 - 1) * rows]):
-            m1 = m1 - 1
+        while m1 > min_m1 and np.abs(Gx[edge + m1 * rows]) >= np.abs(
+            Gx[edge + (m1 - 1) * rows]
+        ):
+            m1 -= 1
 
-        while m2 < 4 and np.abs(Gx[edge + m2 * rows]) >= np.abs(Gx[edge + (m2 + 1) * rows]):
-            m2 = m2 + 1
+        while m2 < max_m2 and np.abs(Gx[edge + m2 * rows]) >= np.abs(
+            Gx[edge + (m2 + 1) * rows]
+        ):
+            m2 += 1
 
-        while r1 > min_r1 and np.abs(Gx[edge + 1 + r1 * rows]) >= np.abs(Gx[edge + 1 + (r1 - 1) * rows]):
-            r1 = r1 - 1
+        while r1 > min_r1 and np.abs(Gx[edge + r1 * rows + 1]) >= np.abs(
+            Gx[edge + (r1 - 1) * rows + 1]
+        ):
+            r1 -= 1
 
-        while r2 < max_r2 and np.abs(Gx[edge + 1 + r2 * rows]) >= np.abs(Gx[edge + 1 + (r2 + 1) * rows]):
-            r2 = r2 + 1
+        while r2 < max_r2 and np.abs(Gx[edge + r2 * rows + 1]) >= np.abs(
+            Gx[edge + (r2 + 1) * rows + 1]
+        ):
+            r2 += 1
 
+        # window 权重: 为了加速恢复过程，合成子图像中的中间列使用更高的权重
         window = np.zeros((3, 9))
-        window[0, l1 + 5-1:l2 + 5] = 1
-        window[1, m1 + 5-1:m2 + 5] = 100
-        window[2, r1 + 5-1:r2 + 5] = 1
+        window[0, l1 + 5 - 1 : l2 + 5] = 1
+        window[1, m1 + 5 - 1 : m2 + 5] = 100
+        window[2, r1 + 5 - 1 : r2 + 5] = 1
 
-        # compute intensities
+        # 根据 m 的符号计算 AA 和 BB
         if m > 0:
-            AA = (GG[edge + m2 * rows] + GG[edge + 1 + r2 * rows]) / 2
-            BB = (GG[edge - 1 + l1 * rows] + GG[edge + m1 * rows]) / 2
+            # (右侧 + 下边一行的右侧) / 2 **
+            # (左侧 + 上边一行的左侧) / 2  **
+            AA = (
+                image_smooth_flatten[edge + m2 * rows]
+                + image_smooth_flatten[edge + r2 * rows + 1]
+            ) / 2
+            BB = (
+                image_smooth_flatten[edge + m1 * rows]
+                + image_smooth_flatten[edge + l1 * rows - 1]
+            ) / 2
         else:
-            AA = (GG[edge - 1 + l2 * rows] + GG[edge + m2 * rows]) / 2
-            BB = (GG[edge + m1 * rows] + GG[edge + 1 + r1 * rows]) / 2
+            # (右侧 + 上边一行的右侧) / 2  **
+            # (左侧 + 下边一行的左侧) / 2 **
+            AA = (
+                image_smooth_flatten[edge + m2 * rows]
+                + image_smooth_flatten[edge + l2 * rows - 1]
+            ) / 2
+            BB = (
+                image_smooth_flatten[edge + m1 * rows]
+                + image_smooth_flatten[edge + r1 * rows + 1]
+            ) / 2
 
         # search for a second close edge
         u_border = False
         d_border = False
 
-        if m1 > -4:
-            partial = np.abs(GG[edge + (m1 - 2) * rows])
-            if partial > np.abs(GG[edge] / 4) and partial > threshold / 2:
+        # 如果不到范围极限就判断左侧是否有第二条边
+        if m1 > min_m1:
+            # 导数值在到达极限(最小)后突然升高就认为有第二条边
+            # 边界外的梯度
+            part = np.abs(Gx[edge + (m1 - 2) * rows])
+            # 判断边界外的梯度是否突然升高
+            if (
+                part > np.abs(Gx[edge] / 4) and part > threshold / 2
+            ):
                 u_border = True
 
-        if m2 < 4:
-            partial = np.abs(GG[edge + (m2 + 2) * rows])
-            if partial > np.abs(GG[edge] / 4) and partial > threshold / 2:
+        # 如果不到范围极限就判断右侧是否有第二条边
+        if m2 < max_m2:
+            # 导数值在到达极限(最小)后突然升高就认为有第二条边
+            # 边界外的梯度
+            part = np.abs(Gx[edge + (m2 + 2) * rows])
+            # 判断边界外的梯度是否突然升高
+            if (
+                part > np.abs(Gx[edge] / 4) and part > threshold / 2
+            ):
                 d_border = True
 
         SL = 0
         SM = 0
         SR = 0
-        j = np.int(np.floor((edges[k] - 1) / rows) + 1)
-        i = np.int(edges[k] - rows * (j - 1)) + 1
+
+        # 边缘像素中心
+        j = np.int64(np.floor((edge - 1) / rows) + 1)  # w
+        i = np.int64(edge - rows * (j - 1)) + 1  # h
 
         if u_border or d_border:
-            rimvt = np.copy(F[i - 2 - 1:i + 2, j - 5 - 1:j + 5])
+            # 提取子图 [11, 5]
+            rimvt = np.copy(image[i - 3 : i + 2, j - 6 : j + 5])
+
             if u_border:
+                # 使用的原始图像, 而不是模糊后的图像
                 if m > 0:
-                    BB = (FF[edge + m1 * rows] + FF[edge - 1 + l1 * rows]) / 2
+                    # (左侧 + 上边一行的左侧) / 2
+                    BB = (
+                        image_flatten[edge + m1 * rows]
+                        + image_flatten[edge + l1 * rows - 1]
+                    ) / 2
                     p = 1
                 else:
-                    BB = (FF[edge + m1 * rows] + FF[edge + 1 + r1 * rows]) / 2
+                    # (左侧 + 下边一行的左侧) / 2
+                    BB = (
+                        image_flatten[edge + m1 * rows]
+                        + image_flatten[edge + r1 * rows + 1]
+                    ) / 2
                     p = 0
 
+                # ll 是 l1 l2 上边的一行
                 if Gx[edge - 2 + (l1 + p) * rows] * Gx[edge] > 0:
                     ll = l1 + p - 1
                 else:
                     ll = l1 + p
 
+                # rr 是 r1 r2 下边的一行
                 if Gx[edge + 2 + (r1 + 1 - p) * rows] * Gx[edge] > 0:
                     rr = r1 - p
                 else:
-                    rr = r1 + 1 - p
+                    rr = r1 - p + 1
 
-                rimvt[0, 0:ll + 6] = BB
-                rimvt[1, 0:l1 + 6] = BB
-                rimvt[2, 0:m1 + 6] = BB
-                rimvt[3, 0:r1 + 6] = BB
-                rimvt[4, 0:rr + 6] = BB
+                # 将子图左侧像素全变为 BB
+                rimvt[0, 0 : ll + 6] = BB
+                rimvt[1, 0 : l1 + 6] = BB
+                rimvt[2, 0 : m1 + 6] = BB
+                rimvt[3, 0 : r1 + 6] = BB
+                rimvt[4, 0 : rr + 6] = BB
 
+                # l1 m1 r1 左移
                 l1 = -3 + m
                 m1 = -3
                 r1 = -3 - m
 
             if d_border:
+                # 使用的原始图像, 而不是模糊后的图像
                 if m > 0:
-                    AA = (FF[edge + m2 * rows] + FF[edge + 1 + r2 * rows]) / 2
+                    # (右侧 + 下边一行的右侧) / 2
+                    AA = (
+                        image_flatten[edge + m2 * rows]
+                        + image_flatten[edge + r2 * rows + 1]
+                    ) / 2
                     p = 1
                 else:
-                    AA = (FF[edge + m2 * rows] + FF[edge - 1 + l2 * rows]) / 2
+                    # (右侧 + 上边一行的右侧) / 2
+                    AA = (
+                        image_flatten[edge + m2 * rows]
+                        + image_flatten[edge + l2 * rows - 1]
+                    ) / 2
                     p = 0
 
+                # ll 是 l1 l2 上边的一行
                 if Gx[edge - 2 + (l2 + p - 1) * rows] * Gx[edge] > 0:
                     ll = l2 + p
                 else:
                     ll = l2 + p - 1
 
+                # rr 是 r1 r2 下边的一行
                 if Gx[edge + 2 + (r2 - p) * rows] * Gx[edge] > 0:
-                    rr = r2 + 1 - p
+                    rr = r2 - p + 1
                 else:
                     rr = r2 - p
 
-                rimvt[0, ll + 6-1:11] = AA
-                rimvt[1, l2 + 6-1:11] = AA
-                rimvt[2, m2 + 6-1:11] = AA
-                rimvt[3, r2 + 6-1:11] = AA
-                rimvt[4, rr + 6-1:11] = AA
+                # 将子图右侧像素全变为 AA
+                rimvt[0, ll + 5 : 11] = AA
+                rimvt[1, l2 + 5 : 11] = AA
+                rimvt[2, m2 + 5 : 11] = AA
+                rimvt[3, r2 + 5 : 11] = AA
+                rimvt[4, rr + 5 : 11] = AA
 
+                # l2 m2 r2 右移
                 l2 = 3 + m
                 m2 = 3
                 r2 = 3 - m
 
-            rimv2 = (rimvt[0:3, 0:9] + rimvt[1:4, 0:9] + rimvt[2:5, 0:9] +
-                     rimvt[0:3, 1:10] + rimvt[1:4, 1:10] + rimvt[2:5, 1:10] +
-                     rimvt[0:3, 2:11] + rimvt[1:4, 2:11] + rimvt[2:5, 2:11]) / 9
+            # 对子图像 F' 进行平滑处理以获得子图像 G'
+            # 生成子图2 [5, 11] -> [3, 9], 使用 [3, 9] 的滑动窗口在子图中取值, 然后取均值
+            rimv2 = (
+                rimvt[0:3, 0:9]
+                + rimvt[1:4, 0:9]
+                + rimvt[2:5, 0:9]
+                + rimvt[0:3, 1:10]
+                + rimvt[1:4, 1:10]
+                + rimvt[2:5, 1:10]
+                + rimvt[0:3, 2:11]
+                + rimvt[1:4, 2:11]
+                + rimvt[2:5, 2:11]
+            ) / 9
 
+            # 使用子图2计算 SL SM SR
             for n in range(l1 + 5 - 1, l2 + 5):
-                SL = SL + rimv2[0, n]
+                SL += rimv2[0, n]
             for n in range(m1 + 5 - 1, m2 + 5):
-                SM = SM + rimv2[1, n]
+                SM += rimv2[1, n]
             for n in range(r1 + 5 - 1, r2 + 5):
-                SR = SR + rimv2[2, n]
+                SR += rimv2[2, n]
         else:
-
+            # 累加像素值,强度求和
+            # 上侧
             for n in range(l1, l2 + 1):
-                SL = SL + GG[edge - 1 + n * rows]
+                SL += image_smooth_flatten[edge + n * rows - 1]
+            # 中间
             for n in range(m1, m2 + 1):
-                SM = SM + GG[edge + n * rows]
+                SM += image_smooth_flatten[edge + n * rows]
+            # 下侧
             for n in range(r1, r2 + 1):
-                SR = SR + GG[edge + 1 + n * rows]
+                SR += image_smooth_flatten[edge + n * rows + 1]
 
-        # compute edge features
+        # 分母
         den = 2 * (AA - BB)
+
+        # 根据 order 和分母 den 的值计算多项式系数 c, b 和 a
+        #  y = a + b * x + c * x^2
+        # 公式多的部分在 5.1 章
         if order == 2:
+            # 二阶多项式
             if den != 0:
-                c[k] = np.divide((SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1)), den)
+                c[k] = (
+                    SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1)
+                ) / den
         else:
+            # 一阶多项式
             c[k] = 0
 
         if den != 0:
-            a[k] = np.divide((2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1)), den) - w * c[k]
-            if np.abs(a[k].item()) > 1:
+            # a 和位置偏移有关
+            a[k] = (2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1)) / den - w * c[k]
+
+            # 偏移最大距离
+            if np.abs(a[k].item()) > max_valid_offset:
                 valid[k] = False
                 continue
-
             valid[k] = True
-            b[k] = np.divide((SR - SL + AA * (l2 - r2) - BB * (l1 - r1)), den)
-            A[k] = AA
-            B[k] = BB
 
-            s = np.sign(AA - BB)
-            nx[k] = s / np.sqrt(1 + b[k] ** 2)
-            ny[k] = s / np.sqrt(1 + b[k] ** 2) * b[k]
+            b[k] = (SR - SL + AA * (l2 - r2) - BB * (l1 - r1)) / den
+
+            nx[k] = np.sign(AA - BB) / np.sqrt(1 + b[k] ** 2)
+            ny[k] = np.sign(AA - BB) / np.sqrt(1 + b[k] ** 2) * b[k]
+
             curv[k] = 2 * c[k] / ((1 + b[k] ** 2) ** 1.5)
             if Gx[edge] < 0:
-                curv[k] = -curv[k]
+                curv[k] = -curv[k]  # 梯度方向相反
 
-            # generate circle subimage
-            if curv[k].item() != 0:
-                R = np.abs(1 / curv[k].item())
-            if R > 1e4:
-                R = 1e4
+        # 计算得到的 AA BB 存储到 A 和 B 数组中
+        A[k] = AA
+        B[k] = BB
 
-            if R < 4.5:
-                R = 4.5
+        # --------------------各向异性过滤--------------------#
+        radius = 0  # prevent not associated
+        # generate circle subimage
+        if curv[k].item() != 0:
+            # 曲率半径 = 1 / 曲率
+            radius = np.abs(1 / curv[k].item())
 
-            if curv[k].item() > 0:
-                s = -1
-                inner_intensity = min(AA, BB)
-                outer_intensity = max(AA, BB)
-            else:
-                s = 1
-                inner_intensity = max(AA, BB)
-                outer_intensity = min(AA, BB)
+        if radius > 1e4:
+            radius = 1e4
 
-        center = [x[edge] + 1 - a[k] + s * R * nx[k], y[edge] + 1 + s * R * ny[k]]
-        subimage = circle_horizontal_window(j, i, center[0], center[1],
-                                                R, inner_intensity, outer_intensity, pixelGridResol)
+        if radius < 4.5:
+            radius = 4.5
 
-        # update counter and intensity images
-        I[i-1-1:i+1,j-4-1:j+4] = I[i-1-1:i+1,j-4-1:j+4] + window*subimage
-        C[i-1-1:i+1,j-4-1:j+4] = C[i-1-1:i+1,j-4-1:j+4] + window
+        if curv[k].item() > 0:
+            s = -1
+            inner_intensity = min(AA, BB)
+            outer_intensity = max(AA, BB)
+        else:
+            s = 1
+            inner_intensity = max(AA, BB)
+            outer_intensity = min(AA, BB)
 
-    edges = edges[valid.reshape((-1,))]
-    A = A[valid.reshape((-1,))]
-    B = B[valid.reshape((-1,))]
-    a = a[valid.reshape((-1,))]
-    b = b[valid.reshape((-1,))]
-    c = c[valid.reshape((-1,))]
-    nx = nx[valid.reshape((-1,))].reshape((-1,))
-    ny = ny[valid.reshape((-1,))].reshape((-1,))
+        # 计算圆的中心
+        center = [
+            (x[edge] + 1 - a[k] + s * radius * nx[k]).item(),
+            (y[edge] + 1 + s * radius * ny[k]).item(),
+        ]
+        # 在检测到边缘的像素处，使用获得的特征值（子像素位置、方向、曲率和两侧强度变化）生成包含完美边缘的恢复子图像  [3, 9]
+        subimage = circle_horizontal_window(
+            j,  # 边缘像素中心 x
+            i,  # 边缘像素中心 y
+            center[0],  # 圆的中心 x 坐标
+            center[1],  # 圆的中心 y 坐标
+            radius,  # 圆的半径
+            inner_intensity,
+            outer_intensity,
+            pixelGridResol,
+        )
 
-    x = x[edges] - a.transpose().ravel()
+        # update counter and intensity images [9, 3]
+        # 强度图像, 每个像素值表示每个像素的强度的累积总和, 存储 window 权重 * 子图
+        # window 和 subimage 形状相同
+        intensity_image[i - 2 : i + 1, j - 5 : j + 4] += window * subimage
+        # 计数图像, 每个像素值表示包括该像素的子图像的数量, 存储 window 权重
+        counter[i - 2 : i + 1, j - 5 : j + 4] += window
+        # --------------------各向异性过滤--------------------#
+
+    # remove invalid values
+    edges = edges[valid]
+    A = A[valid]
+    B = B[valid]
+    a = a[valid]
+    b = b[valid]
+    c = c[valid]
+
+    # nx 和 ny
+    # 含义：这两个数组组成了一个单位法向量，即在边缘处的“法向”（或称垂直方向）。
+    # 计算过程：
+    #     – 程序先通过比较边缘两侧的平均强度（A 与 B）确定边缘方向的“极性”，用 np.sign(A-B) 得到正负信息。
+    #     – 同时，利用参数 b（拟合多项式 y = a + b*x 得到的一阶项，即局部斜率）计算了归一化因子 1/√(1+b²) 。
+    #     – 最终，nx 按公式 nx = np.sign(A-B)·b/√(1+b²) 得到，而 ny = np.sign(A-B)/√(1+b²) 。
+    # 几何意义：
+    #     – 如果设拟合曲线的局部斜率为 tanθ，则 ny 对应 cosθ 而 nx 对应 sinθ（外加一个与边缘强度变化方向有关的符号）。
+    #     – 这样得到 (nx, ny) 就是指向边缘“正面”（通常由暗侧指向亮侧）的单位法向量，可用于后续的边缘精细定位或形状分析。
+    nx = nx[valid]
+    ny = ny[valid]
+
+    # 像素边缘坐标
+    pixel_x = x[edges]
+    pixel_y = y[edges]
+
+    # 亚像素边缘坐标, x 方向为亚像素坐标, y 方向为像素坐标
+    x = x[edges] - a
     y = y[edges]
 
-    curv = curv[valid.reshape((-1,))].reshape((-1,))
+    # curv (边缘曲率)
+    # 含义：curv 表示边缘在亚像素层面处的曲率，即描述边缘弯曲程度和方向的一个量。
+    # 计算过程：
+    #     – 在拟合局部灰度变化时，若 order==2，则通过二阶多项式拟合 (即 y = a + b·x + c·x²) 得到二阶系数 c。
+    #     – 标准二阶曲线的曲率公式为 2·c/(1+b²)^(3/2) ，这里程序中又乘上了 nn ，nn 根据 Gy 的正负（梯度 y 分量）调整符号，使得曲率的正负方向与梯度方向相一致。
+    # 几何意义：
+    #     – curv 的数值表示边缘局部弯曲的程度：绝对值越大说明弯曲越明显；正负则指示边缘向哪一侧弯曲。
+    #     – 若 order 为 1（二阶项为 0），则 curv 归零，表明边缘局部近似直线。
+    curv = curv[valid]
 
-    i0 = np.minimum(A, B).reshape((-1,))
-    i1 = np.maximum(A, B).reshape((-1,))
+    # i0 和 i1
+    # 含义：这两个值描述边缘两侧的平均灰度值。
+    # 计算过程：
+    #     – A 与 B 分别是通过在边缘点两侧（由 m1, m2, l1, l2, r1, r2 所限定的像素区域）对图像像素灰度进行加权或平均得到的。
+    #     – 为了区分边缘的暗侧和亮侧，通过 np.minimum(A, B) 得到 i0（较暗的一侧），而 np.maximum(A, B) 得到 i1（较亮的一侧）。
+    # 意义与应用：
+    #     – i0 和 i1 为后续边缘分析（例如边缘分类、阈值选择或进一步精细定位）提供了边缘两侧的灰度信息。
+    #     – 边缘由灰度的突变引起，i0 与 i1 的差异往往决定了边缘的对比度及检测的鲁棒性。
+    i0 = np.minimum(A, B)
+    i1 = np.maximum(A, B)
 
-    return x, y, edges, nx, ny, i0, i1, curv, I, C, G
+    # edges, pixel_x, pixel_y, x, y, nx, ny, curv, i0, i1 all shape: [28]
+    # intensity_image, counter all shape: [30, 30]
+    return edges, pixel_x, pixel_y, x, y, nx, ny, curv, i0, i1, intensity_image, counter
+
+
+def test_h_v_edges():
+    image = np.array([[255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 240.0, 249.0, 221.0, 164.0, 165.0, 222.0, 249.0, 240.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 243.0, 212.0, 62.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 62.0, 213.0, 243.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 245.0, 123.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 124.0, 245.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 245.0, 53.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 54.0, 245.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 243.0, 124.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 125.0, 243.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 212.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 213.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 240.0, 62.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 62.0, 240.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 249.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 250.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 222.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 223.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 165.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 167.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 165.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 167.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 222.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 223.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 249.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 250.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 240.0, 62.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 62.0, 240.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 212.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 213.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 243.0, 124.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 125.0, 243.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 245.0, 54.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 54.0, 245.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 245.0, 124.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 125.0, 244.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 243.0, 213.0, 62.0, 9.0, 0.0, 0.0, 0.0, 0.0, 10.0, 62.0, 213.0, 243.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 253.0, 240.0, 250.0, 223.0, 167.0, 167.0, 223.0, 250.0, 240.0, 253.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0], [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0]])
+    image_flatten = image.ravel("F")
+    image_smooth_flatten = np.array([113.33333333333333, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 113.33333333333333, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 253.11111111111111, 252.44444444444443, 249.0, 240.66666666666669, 231.33333333333337, 231.33333333333334, 240.66666666666666, 249.0, 252.44444444444446, 253.11111111111114, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 248.66666666666666, 225.55555555555551, 198.88888888888889, 171.88888888888889, 156.66666666666669, 146.33333333333331, 146.33333333333331, 156.66666666666666, 171.88888888888889, 198.88888888888889, 225.55555555555557, 248.66666666666669, 253.66666666666669, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 253.66666666666669, 237.77777777777777, 205.11111111111111, 154.77777777777777, 114.33333333333331, 86.88888888888889, 71.66666666666666, 61.33333333333333, 61.33333333333333, 71.66666666666666, 86.88888888888889, 114.33333333333333, 154.77777777777777, 205.11111111111111, 237.77777777777777, 253.66666666666669, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 230.11111111111111, 185.88888888888886, 126.22222222222221, 71.66666666666666, 31.888888888888886, 7.888888888888888, 1.0, 0.0, 0.0, 1.0, 7.888888888888888, 31.888888888888886, 71.66666666666666, 126.33333333333331, 186.00000000000003, 230.22222222222226, 253.66666666666669, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 237.66666666666666, 185.77777777777777, 115.88888888888889, 47.33333333333333, 14.222222222222221, 0.4444444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4444444444444444, 14.222222222222221, 47.44444444444444, 116.11111111111111, 186.0, 237.7777777777778, 253.66666666666669, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 248.66666666666666, 204.99999999999997, 126.11111111111111, 47.222222222222214, 5.888888888888888, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 47.44444444444444, 126.44444444444443, 205.22222222222223, 248.7777777777778, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.11111111111111, 225.55555555555551, 154.66666666666666, 71.55555555555556, 14.11111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 14.222222222222221, 71.77777777777777, 154.88888888888886, 225.66666666666669, 253.11111111111114, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 252.44444444444443, 198.88888888888886, 114.33333333333331, 31.888888888888886, 0.4444444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4444444444444444, 31.999999999999996, 114.55555555555554, 199.11111111111111, 252.55555555555557, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 248.88888888888886, 171.77777777777774, 86.77777777777777, 7.888888888888888, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.888888888888888, 87.1111111111111, 172.11111111111111, 249.22222222222226, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 240.44444444444443, 156.44444444444443, 71.44444444444443, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 72.1111111111111, 157.11111111111111, 241.11111111111111, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 231.11111111111111, 146.11111111111111, 61.1111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 61.888888888888886, 146.88888888888889, 231.8888888888889, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 231.22222222222223, 146.22222222222223, 61.22222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 61.888888888888886, 146.88888888888889, 231.8888888888889, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 240.66666666666666, 156.66666666666666, 71.66666666666666, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.1111111111111112, 72.22222222222221, 157.22222222222223, 241.11111111111111, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 248.99999999999997, 171.88888888888886, 86.88888888888889, 7.888888888888888, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 87.2222222222222, 172.2222222222222, 249.22222222222226, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 252.44444444444443, 198.99999999999997, 114.44444444444444, 31.999999999999996, 0.4444444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4444444444444444, 32.11111111111111, 114.66666666666666, 199.22222222222226, 252.5555555555556, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.11111111111111, 225.66666666666666, 154.88888888888889, 71.77777777777777, 14.222222222222221, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 14.333333333333332, 71.88888888888889, 155.0, 225.6666666666667, 253.11111111111114, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 248.7777777777778, 205.22222222222223, 126.44444444444443, 47.44444444444444, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 47.44444444444444, 126.44444444444444, 205.22222222222223, 248.77777777777783, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 237.7777777777778, 186.0, 116.22222222222223, 47.55555555555555, 14.333333333333332, 0.4444444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4444444444444444, 14.333333333333332, 47.55555555555556, 116.22222222222221, 186.0, 237.7777777777778, 253.66666666666669, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 230.22222222222226, 186.11111111111111, 126.55555555555554, 71.88888888888889, 32.11111111111111, 8.0, 1.1111111111111112, 0.0, 0.0, 1.1111111111111112, 8.0, 32.11111111111111, 71.88888888888889, 126.55555555555556, 186.0, 230.11111111111114, 253.5555555555556, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 253.6666666666667, 237.8888888888889, 205.33333333333334, 154.99999999999997, 114.66666666666666, 87.22222222222221, 72.22222222222221, 61.888888888888886, 61.888888888888886, 72.22222222222221, 87.2222222222222, 114.66666666666666, 155.0, 205.33333333333334, 237.88888888888889, 253.6666666666667, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 253.66666666666669, 248.7777777777778, 225.66666666666666, 199.22222222222223, 172.22222222222223, 157.2222222222222, 146.88888888888889, 146.88888888888889, 157.22222222222223, 172.22222222222223, 199.22222222222223, 225.66666666666669, 248.7777777777778, 253.66666666666669, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 254.7777777777778, 253.11111111111114, 252.55555555555557, 249.22222222222223, 241.11111111111111, 231.8888888888889, 231.88888888888889, 241.11111111111111, 249.22222222222223, 252.5555555555556, 253.11111111111114, 254.7777777777778, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 170.0, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 255.00000000000003, 170.0, 113.33333333333333, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 170.0, 113.33333333333333])
+    Gx = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 28.333333333333336, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 42.500000000000014, 28.333333333333336, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.11111111111111427, -0.9444444444444571, -1.2777777777777999, -3.000000000000014, -7.166666666666671, -11.833333333333329, -11.833333333333343, -7.166666666666686, -3.000000000000014, -1.2777777777777857, -0.9444444444444429, -0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.6666666666666714, -3.1666666666666856, -14.722222222222257, -28.05555555555557, -41.55555555555557, -49.16666666666667, -54.33333333333336, -54.33333333333336, -49.166666666666686, -41.55555555555557, -28.05555555555557, -14.722222222222229, -3.1666666666666714, -0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.11111111111111427, -0.6666666666666714, -8.611111111111128, -24.833333333333343, -49.16666666666667, -69.05555555555556, -81.05555555555556, -84.50000000000001, -85.00000000000003, -85.0, -84.5, -81.05555555555556, -69.05555555555557, -49.166666666666686, -24.833333333333343, -8.611111111111128, -0.6666666666666714, -0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.6666666666666714, -12.444444444444457, -33.888888888888914, -61.22222222222222, -76.94444444444443, -83.5, -82.0, -77.83333333333334, -73.16666666666666, -73.16666666666666, -77.83333333333333, -82.0, -83.5, -76.94444444444446, -61.166666666666686, -33.83333333333333, -12.388888888888886, -0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.6666666666666714, -8.555555555555571, -33.94444444444446, -60.94444444444444, -78.88888888888889, -70.27777777777777, -56.944444444444436, -43.44444444444444, -35.83333333333333, -30.666666666666664, -30.666666666666664, -35.83333333333333, -43.44444444444444, -56.94444444444444, -70.27777777777777, -78.83333333333334, -60.83333333333333, -33.83333333333334, -8.5, -0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.11111111111111427, -3.1666666666666856, -24.333333333333357, -52.0, -69.33333333333331, -60.166666666666664, -35.83333333333333, -15.944444444444443, -3.944444444444444, -0.5, 0.0, 0.0, -0.5, -3.944444444444444, -15.944444444444443, -35.83333333333333, -60.16666666666666, -69.2777777777778, -51.888888888888914, -24.22222222222223, -3.1111111111111143, -0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.9444444444444571, -14.055555555555586, -41.5, -57.11111111111111, -50.888888888888886, -23.666666666666664, -7.111111111111111, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.2222222222222222, -7.111111111111111, -23.72222222222222, -50.94444444444444, -57.111111111111114, -41.44444444444447, -14.0, -0.9444444444444429, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.1666666666666856, -24.8888888888889, -45.33333333333333, -47.111111111111114, -23.388888888888886, -2.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.0, -23.5, -47.222222222222214, -45.33333333333334, -24.833333333333343, -1.1111111111111143, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.1111111111111285, -26.888888888888886, -33.94444444444444, -31.833333333333336, -7.055555555555555, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -7.111111111111111, -31.944444444444443, -33.88888888888888, -26.777777777777786, -1.9444444444444429, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -6.0, -21.222222222222214, -21.444444444444443, -15.444444444444443, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.2222222222222222, -15.499999999999998, -21.22222222222222, -21.0, -5.7222222222222285, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -8.888888888888872, -12.833333333333314, -12.833333333333336, -3.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.944444444444444, -12.611111111111107, -12.611111111111114, -8.666666666666671, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -4.6111111111111, -5.1111111111111, -5.111111111111104, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, -5.111111111111107, -5.111111111111114, -4.6111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.7777777777777715, 5.2777777777777715, 5.277777777777779, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5555555555555556, 5.166666666666664, 5.166666666666671, 4.6111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.888888888888872, 12.833333333333314, 12.833333333333332, 3.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 12.666666666666657, 12.666666666666657, 8.666666666666671, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.888888888888886, 21.166666666666657, 21.388888888888893, 15.499999999999998, 0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 15.499999999999998, 21.22222222222222, 21.000000000000014, 5.722222222222243, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0555555555555713, 26.8888888888889, 34.0, 31.944444444444443, 7.111111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.166666666666666, 31.944444444444443, 33.8888888888889, 26.722222222222257, 1.9444444444444429, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.1666666666666856, 24.888888888888914, 45.38888888888889, 47.222222222222214, 23.5, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 23.5, 47.16666666666667, 45.277777777777786, 24.777777777777786, 1.1111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9444444444444571, 14.000000000000014, 41.44444444444446, 57.111111111111114, 51.0, 23.777777777777775, 7.166666666666666, 0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 7.166666666666666, 23.77777777777778, 50.94444444444444, 57.05555555555556, 41.3888888888889, 13.999999999999986, 0.9444444444444429, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.11111111111111427, 3.1111111111111143, 24.22222222222223, 51.888888888888914, 69.33333333333334, 60.27777777777777, 35.94444444444444, 16.055555555555554, 4.0, 0.5555555555555556, 0.0, 0.0, 0.5555555555555556, 4.0, 16.055555555555554, 35.94444444444444, 60.27777777777778, 69.27777777777777, 51.83333333333335, 24.166666666666686, 3.1111111111111, 0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6666666666666714, 8.5, 33.83333333333336, 60.83333333333334, 78.8888888888889, 70.33333333333331, 57.11111111111111, 43.61111111111111, 36.11111111111111, 30.944444444444443, 30.944444444444443, 36.11111111111111, 43.6111111111111, 57.11111111111111, 70.33333333333333, 78.88888888888889, 60.833333333333336, 33.83333333333336, 8.5, 0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6666666666666714, 12.388888888888886, 33.777777777777786, 61.11111111111113, 76.88888888888889, 83.55555555555556, 82.11111111111111, 78.05555555555554, 73.44444444444444, 73.44444444444444, 78.05555555555556, 82.11111111111111, 83.55555555555556, 76.8888888888889, 61.11111111111112, 33.83333333333334, 12.444444444444443, 0.7222222222222143, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.11111111111111427, 0.6666666666666572, 8.555555555555557, 24.72222222222223, 49.055555555555586, 68.94444444444446, 81.0, 84.44444444444446, 85.00000000000001, 85.0, 84.44444444444446, 81.00000000000001, 68.94444444444447, 49.05555555555557, 24.72222222222223, 8.555555555555571, 0.6666666666666572, 0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6666666666666714, 3.1111111111111143, 14.666666666666686, 27.8888888888889, 41.3888888888889, 48.888888888888914, 54.05555555555557, 54.05555555555557, 48.8888888888889, 41.3888888888889, 27.8888888888889, 14.666666666666671, 3.1111111111111143, 0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.11111111111111427, 0.9444444444444429, 1.2222222222222285, 2.8888888888889, 6.944444444444457, 11.555555555555557, 11.555555555555571, 6.944444444444457, 2.8888888888889, 1.2222222222222143, 0.9444444444444429, 0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -28.333333333333336, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -42.500000000000014, -28.333333333333336, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    Gy = np.array([0.0, 28.333333333333336, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -28.333333333333336, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.11111111111111427, -0.9444444444444571, -1.1666666666666856, -2.055555555555557, -5.8888888888888715, -8.833333333333314, -4.666666666666671, 4.666666666666643, 8.833333333333329, 5.8888888888889, 2.0555555555555713, 1.1666666666666714, 0.9444444444444429, 0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, -0.6666666666666714, -3.1666666666666856, -14.055555555555586, -24.888888888888886, -26.833333333333314, -21.1111111111111, -12.777777777777786, -5.166666666666686, 5.166666666666671, 12.777777777777786, 21.111111111111114, 26.833333333333343, 24.8888888888889, 14.055555555555557, 3.1666666666666714, 0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, -0.11111111111111427, -0.6666666666666714, -8.500000000000014, -24.277777777777786, -41.5, -45.3888888888889, -33.94444444444444, -21.33333333333333, -12.777777777777779, -5.166666666666664, 5.166666666666664, 12.777777777777779, 21.333333333333336, 33.94444444444444, 45.38888888888889, 41.5, 24.277777777777786, 8.500000000000014, 0.6666666666666714, 0.11111111111111427, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, -0.6666666666666714, -12.444444444444457, -33.888888888888914, -51.94444444444445, -57.1111111111111, -47.166666666666664, -31.888888888888886, -15.444444444444443, -3.944444444444444, -0.5, 0.5, 3.944444444444444, 15.444444444444443, 31.888888888888886, 47.222222222222214, 57.166666666666686, 51.94444444444447, 33.83333333333333, 12.388888888888886, 0.6666666666666714, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, -0.6666666666666714, -8.666666666666686, -33.94444444444446, -60.888888888888886, -69.22222222222223, -50.83333333333333, -23.444444444444443, -7.111111111111111, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 7.111111111111111, 23.5, 50.94444444444444, 69.27777777777777, 60.83333333333334, 33.83333333333334, 8.611111111111114, 0.6666666666666714, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -0.11111111111111427, -3.1666666666666856, -24.888888888888914, -61.27777777777777, -78.88888888888889, -60.111111111111114, -23.611111111111107, -2.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 23.72222222222222, 60.222222222222214, 78.88888888888889, 61.166666666666686, 24.777777777777786, 3.1111111111111143, 0.11111111111111427, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -0.9444444444444571, -14.722222222222257, -49.22222222222223, -76.99999999999997, -70.27777777777777, -35.77777777777778, -7.055555555555555, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.111111111111111, 35.888888888888886, 70.33333333333331, 76.94444444444446, 49.11111111111114, 14.666666666666671, 0.9444444444444429, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -1.2777777777777999, -28.055555555555586, -69.05555555555556, -83.49999999999999, -56.944444444444436, -15.944444444444443, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 15.999999999999998, 57.05555555555555, 83.55555555555556, 69.00000000000001, 27.944444444444457, 1.2222222222222285, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -3.0555555555555856, -41.61111111111114, -81.05555555555554, -81.94444444444443, -43.388888888888886, -3.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.944444444444444, 43.55555555555555, 82.11111111111111, 81.05555555555557, 41.44444444444446, 2.8888888888888857, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -7.2777777777778, -49.2777777777778, -84.5, -77.72222222222221, -35.722222222222214, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 36.05555555555555, 78.05555555555556, 84.5, 48.94444444444446, 6.944444444444457, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -11.944444444444457, -54.44444444444446, -85.0, -73.05555555555556, -30.55555555555555, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.944444444444443, 73.44444444444444, 85.00000000000001, 54.05555555555557, 11.555555555555557, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -11.8888888888889, -54.3888888888889, -85.0, -73.11111111111111, -30.61111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.944444444444443, 73.44444444444444, 85.00000000000001, 54.05555555555557, 11.555555555555557, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -7.166666666666686, -49.166666666666686, -84.5, -77.83333333333333, -35.83333333333333, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5555555555555556, 36.11111111111111, 78.05555555555556, 84.44444444444446, 48.8888888888889, 6.944444444444457, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -3.0000000000000284, -41.555555555555586, -81.05555555555554, -81.99999999999999, -43.44444444444444, -3.944444444444444, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 43.6111111111111, 82.1111111111111, 81.00000000000003, 41.388888888888914, 2.8888888888888857, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -1.2777777777777999, -28.00000000000003, -69.0, -83.49999999999999, -57.0, -15.999999999999998, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 16.055555555555554, 57.11111111111111, 83.55555555555557, 68.94444444444447, 27.888888888888886, 1.2222222222222143, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -0.9444444444444571, -14.666666666666686, -49.111111111111114, -76.94444444444444, -70.33333333333333, -35.888888888888886, -7.111111111111111, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.166666666666666, 35.94444444444444, 70.33333333333333, 76.88888888888891, 49.05555555555557, 14.666666666666657, 0.9444444444444429, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, -0.11111111111111427, -3.1111111111111143, -24.777777777777786, -61.166666666666686, -78.88888888888889, -60.222222222222214, -23.72222222222222, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 23.72222222222222, 60.22222222222222, 78.88888888888889, 61.16666666666669, 24.777777777777786, 3.1111111111111, 0.11111111111111427, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, -0.6666666666666714, -8.611111111111114, -33.83333333333334, -60.777777777777786, -69.22222222222223, -50.94444444444445, -23.555555555555554, -7.166666666666666, -0.2222222222222222, 0.0, 0.0, 0.0, 0.0, 0.2222222222222222, 7.166666666666666, 23.555555555555557, 50.94444444444444, 69.22222222222223, 60.77777777777779, 33.83333333333334, 8.611111111111114, 0.6666666666666714, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, -0.6666666666666714, -12.388888888888886, -33.777777777777786, -51.83333333333336, -57.111111111111114, -47.222222222222214, -31.944444444444443, -15.499999999999998, -4.0, -0.5555555555555556, 0.5555555555555556, 4.0, 15.499999999999998, 31.944444444444443, 47.22222222222223, 57.05555555555556, 51.77777777777779, 33.7777777777778, 12.444444444444443, 0.7222222222222143, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, -0.11111111111111427, -0.6666666666666572, -8.444444444444443, -24.166666666666686, -41.44444444444447, -45.33333333333334, -33.88888888888888, -21.22222222222222, -12.666666666666664, -5.166666666666664, 5.166666666666664, 12.666666666666657, 21.22222222222222, 33.8888888888889, 45.33333333333334, 41.44444444444444, 24.166666666666686, 8.444444444444457, 0.6666666666666572, 0.11111111111111427, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, -0.6666666666666714, -3.1111111111111143, -14.000000000000014, -24.777777777777786, -26.722222222222214, -21.000000000000014, -12.666666666666671, -5.166666666666657, 5.166666666666671, 12.666666666666671, 21.0, 26.72222222222223, 24.777777777777786, 14.0, 3.1111111111111143, 0.6666666666666714, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.11111111111111427, -0.9444444444444429, -1.1111111111111143, -1.944444444444457, -5.7222222222222285, -8.666666666666657, -4.611111111111114, 4.6111111111111, 8.666666666666671, 5.722222222222243, 1.944444444444457, 1.1111111111111, 0.9444444444444429, 0.11111111111111427, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 42.500000000000014, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -42.500000000000014, 0.0, 0.0, 28.333333333333336, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -28.333333333333336, 0.0])
+    x = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29])
+    y = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+    h_edges_ = np.array([277, 292, 306, 323, 336, 353, 366, 383, 395, 414, 425, 444, 455, 474, 485, 504, 516, 533, 546, 563, 576, 593, 607, 622])
+    v_edges_ = np.array([163, 164, 165, 166, 190, 191, 192, 197, 198, 199, 219, 230, 248, 261, 638, 651, 669, 680, 700, 701, 702, 707, 708, 709, 733, 734, 735, 736])
+    rows = 30
+    order = 2
+    w = 0.75
+    threshold = 25
+    max_valid_offset = 1
+
+    print("test_h_edges start")
+    intensity_image = np.zeros((30, 30))
+    counter = np.zeros((30, 30))
+    edges, pixel_x, pixel_y, subpixel_x, subpixel_y, nx, ny, curv, i0, i1, intensity_image, counter = h_edges(
+        image,
+        image_flatten,
+        image_smooth_flatten,
+        Gx,
+        Gy,
+        x,
+        y,
+        h_edges_,
+        rows,
+        order,
+        w,
+        threshold,
+        max_valid_offset,
+        intensity_image,
+        counter,
+    )
+    print(f"edges: {edges}")
+    print(f"pixel_x: {pixel_x}")
+    print(f"pixel_y: {pixel_y}")
+    print(f"subpixel_x: {subpixel_x}")
+    print(f"subpixel_y: {subpixel_y}")
+    print(f"nx: {nx}")
+    print(f"ny: {ny}")
+    print(f"curv: {curv}")
+    print(f"i0: {i0}")
+    print(f"i1: {i1}")
+    print(f"intensity_image: {np.max(intensity_image)} {np.min(intensity_image)} {np.mean(intensity_image)} {np.var(intensity_image)} {np.std(intensity_image)}")
+    print(f"counter: {np.max(counter)} {np.min(counter)} {np.mean(counter)} {np.var(counter)} {np.std(counter)}")
+    print("test_h_edges end\n")
+
+    print("test_v_edges start")
+    intensity_image = np.zeros((30, 30))
+    counter = np.zeros((30, 30))
+    edges, pixel_x, pixel_y, subpixel_x, subpixel_y, nx, ny, curv, i0, i1, intensity_image, counter = v_edges(
+        image,
+        image_flatten,
+        image_smooth_flatten,
+        Gx,
+        Gy,
+        x,
+        y,
+        v_edges_,
+        rows,
+        order,
+        w,
+        threshold,
+        max_valid_offset,
+        intensity_image,
+        counter,
+    )
+    print(f"edges: {edges}")
+    print(f"pixel_x: {pixel_x}")
+    print(f"pixel_y: {pixel_y}")
+    print(f"subpixel_x: {subpixel_x}")
+    print(f"subpixel_y: {subpixel_y}")
+    print(f"nx: {nx}")
+    print(f"ny: {ny}")
+    print(f"curv: {curv}")
+    print(f"i0: {i0}")
+    print(f"i1: {i1}")
+    print(f"intensity_image: {np.max(intensity_image)} {np.min(intensity_image)} {np.mean(intensity_image)} {np.var(intensity_image)} {np.std(intensity_image)}")
+    print(f"counter: {np.max(counter)} {np.min(counter)} {np.mean(counter)} {np.var(counter)} {np.std(counter)}")
+    print("test_v_edges end\n")
+
+
+if __name__ == '__main__':
+    test_h_v_edges()

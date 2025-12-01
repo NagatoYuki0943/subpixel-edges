@@ -1,5 +1,5 @@
 import numpy as np
-
+import cv2
 from subpixel_edges.final_detector_iter0 import main_iter0
 from subpixel_edges.final_detector_iter1 import main_iter1
 from subpixel_edges.final_detector_iterN import main_iterN
@@ -18,7 +18,9 @@ def init():
     subpixel_edges(img, 15, 2, 2)
 
 
-def subpixel_edges(img, threshold, iters, order):
+def subpixel_edges(
+    image: np.ndarray, threshold: int | float, iters: int = 0, order: int = 2
+):
     """
     Detects subpixel features for each pixel belonging to an edge in `img`.
 
@@ -28,7 +30,7 @@ def subpixel_edges(img, threshold, iters, order):
 
     Parameters
     ----------
-    img: ndarray
+    image: ndarray
         A grayscale image.
     threshold: int or float
         Specifies the minimum difference of intensity at both
@@ -55,11 +57,16 @@ def subpixel_edges(img, threshold, iters, order):
     -------
     An instance of EdgePixel
     """
+    image = image.astype(np.float64)
     if iters == 0:
-        return main_iter0(img, threshold, iters, order)
+        return main_iter0(image, threshold, order)
     elif iters == 1:
-        return main_iter1(img, threshold, iters, order)
+        return main_iter1(image, threshold, order)
     elif iters > 1:
-        for iterN in range(iters):
-            ep, img = main_iterN(img, threshold, iters, order)
-        return ep
+        for i in range(iters):
+            ep, image, grad, absGyInner, absGxInner = main_iterN(
+                image, threshold, order
+            )
+            # cv2.imwrite(f"iter-{i+1}.png", np.clip(image.round(), 0, 255).astype(np.uint8))
+        # print(f"intensity_image: {np.max(image)} {np.min(image)} {np.mean(image)} {np.var(image)} {np.std(image)}")
+        return ep, grad, absGxInner, absGyInner

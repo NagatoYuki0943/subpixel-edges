@@ -25,6 +25,7 @@ class TestFromMatlab:
     > res0 = struct(subpixelEdges(image, 25, 'Order', 2, 'SmoothingIter', 0));
     > save('data/ring_0.mat', '-struct', 'res0', '-v7');
     """
+
     this_path = os.path.dirname(os.path.realpath(__file__))
 
     def read_image(self, filename):
@@ -32,12 +33,14 @@ class TestFromMatlab:
         return (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype(float)
 
     def read_edges(self, filename):
-        return EdgePixel.load(os.path.join(self.this_path, filename), format='mat')
+        return EdgePixel.load(os.path.join(self.this_path, filename), format="mat")
 
     def test_image_read_same(self):
-        img_gray = self.read_image('images/ring.tif')
+        img_gray = self.read_image("images/ring.tif")
 
-        img_from_mat = io.loadmat(os.path.join(self.this_path, 'data/ring.mat'))['image']
+        img_from_mat = io.loadmat(os.path.join(self.this_path, "data/ring.mat"))[
+            "image"
+        ]
 
         assert img_from_mat.shape == img_gray.shape
         assert np.array_equiv(img_from_mat, img_gray)
@@ -46,9 +49,9 @@ class TestFromMatlab:
         """
         When `iters` = 0, the results are perfectly consistent.
         """
-        test_edges = self.read_edges('data/ring_0.mat')
+        test_edges = self.read_edges("data/ring_0.mat")
 
-        img_gray = self.read_image('images/ring.tif')
+        img_gray = self.read_image("images/ring.tif")
         edges = subpixel_edges(img_gray, 25, 0, 2)
 
         assert np.array_equiv(edges.position, test_edges.position - 1)
@@ -64,9 +67,9 @@ class TestFromMatlab:
         """
         When `iters` = 1, the results are still consistent except for one position value.
         """
-        test_edges = self.read_edges('data/ring_1.mat')
+        test_edges = self.read_edges("data/ring_1.mat")
 
-        img_gray = self.read_image('images/ring.tif')
+        img_gray = self.read_image("images/ring.tif")
         edges = subpixel_edges(img_gray, 25, 1, 2)
 
         mask = np.ones(len(edges.position), dtype=bool)
@@ -82,11 +85,11 @@ class TestFromMatlab:
         assert np.allclose(edges.i0[mask], test_edges.i0[mask])
         assert np.allclose(edges.i1[mask], test_edges.i1[mask])
 
-    @pytest.mark.parametrize('iters', [2, 10, 20])
+    @pytest.mark.parametrize("iters", [2, 10, 20])
     def test_iterN(self, iters):
-        test_edges = self.read_edges(f'data/ring_{iters}.mat')
+        test_edges = self.read_edges(f"data/ring_{iters}.mat")
 
-        img_gray = self.read_image('images/ring.tif')
+        img_gray = self.read_image("images/ring.tif")
         edges = subpixel_edges(img_gray, 25, iters, 2)
 
         assert np.array_equiv(edges.position, test_edges.position - 1)
@@ -98,11 +101,11 @@ class TestFromMatlab:
         assert np.allclose(edges.i0, test_edges.i0, atol=1e-3)
         assert np.allclose(edges.i1, test_edges.i1, atol=1e-3)
 
-    @pytest.mark.parametrize('iters', [2, 10, 20])
+    @pytest.mark.parametrize("iters", [2, 10, 20])
     def test_iterN_with_noise(self, iters):
-        test_edges = self.read_edges(f'data/ring_noise_{iters}.mat')
+        test_edges = self.read_edges(f"data/ring_noise_{iters}.mat")
 
-        img_gray = self.read_image('images/ring_noise.tif')
+        img_gray = self.read_image("images/ring_noise.tif")
         edges = subpixel_edges(img_gray, 25, iters, 2)
 
         assert np.array_equiv(edges.position, test_edges.position - 1)

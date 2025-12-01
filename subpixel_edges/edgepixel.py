@@ -17,50 +17,68 @@ class EdgePixel:
     i0, i1:
         intensities at both sides
     """
-    def __init__(self, position=None, x=None, y=None, nx=None, ny=None, curv=None, i0=None, i1=None):
-        
-        self.position = position  # 1D index inside image
-        self.x = x                # X subpixel position
-        self.y = y                # Y subpixel position
-        self.nx = nx              # normal vector (normalized)
-        self.ny = ny              # normal vector (normalized)
-        self.curv = curv          # curvature
-        self.i0 = i0              # intensities
-        self.i1 = i1              # intensities
 
-    def save(self, filename, format='npz'):
-        if format == 'npz':
+    def __init__(
+        self,
+        position=None,
+        pixel_x=None,
+        pixel_y=None,
+        x=None,
+        y=None,
+        nx=None,
+        ny=None,
+        curv=None,
+        i0=None,
+        i1=None,
+    ):
+        self.position = position  # 1D index inside image
+        self.pixel_x = pixel_x  # X pixel position
+        self.pixel_y = pixel_y  # X pixel position
+        self.x = x  # X subpixel position
+        self.y = y  # Y subpixel position
+        self.nx = nx  # normal vector (normalized)
+        self.ny = ny  # normal vector (normalized)
+        self.curv = curv  # curvature
+        self.i0 = i0  # intensities
+        self.i1 = i1  # intensities
+
+    def save(self, filename, format="npz"):
+        if format == "npz":
             np.savez(filename, **vars(self))
         else:
             raise ValueError('File format "%s" not supported' % format)
 
     @classmethod
-    def load(cls, filename, format='npz'):
-        if format == 'npz':
+    def load(cls, filename, format="npz"):
+        if format == "npz":
             edges = np.load(filename)
 
             return EdgePixel(
-                position=edges['position'],
-                x=edges['x'],
-                y=edges['y'],
-                nx=edges['nx'],
-                ny=edges['ny'],
-                curv=edges['curv'],
-                i0=edges['i0'],
-                i1=edges['i1']
+                position=edges["position"],
+                pixel_x=edges["pixel_x"],
+                pixel_y=edges["pixel_y"],
+                x=edges["x"],
+                y=edges["y"],
+                nx=edges["nx"],
+                ny=edges["ny"],
+                curv=edges["curv"],
+                i0=edges["i0"],
+                i1=edges["i1"],
             )
-        elif format == 'mat':
+        elif format == "mat":
             edges = scipy.io.loadmat(filename)
 
             return EdgePixel(
-                position=edges['position'].ravel('F'),
-                x=edges['x'].ravel('F'),
-                y=edges['y'].ravel('F'),
-                nx=edges['nx'].ravel('F'),
-                ny=edges['ny'].ravel('F'),
-                curv=edges['curv'].ravel('F'),
-                i0=edges['i0'].ravel('F'),
-                i1=edges['i1'].ravel('F')
+                position=edges["position"].ravel("F"),
+                pixel_x=edges["pixel_x"].ravel("F"),
+                pixel_y=edges["pixel_y"].ravel("F"),
+                x=edges["x"].ravel("F"),
+                y=edges["y"].ravel("F"),
+                nx=edges["nx"].ravel("F"),
+                ny=edges["ny"].ravel("F"),
+                curv=edges["curv"].ravel("F"),
+                i0=edges["i0"].ravel("F"),
+                i1=edges["i1"].ravel("F"),
             )
         else:
             raise ValueError('File format "%s" not supported' % format)

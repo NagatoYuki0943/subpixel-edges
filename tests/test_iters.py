@@ -8,11 +8,12 @@ from subpixel_edges import subpixel_edges
 from subpixel_edges.edgepixel import EdgePixel
 
 
-@pytest.mark.parametrize('iters', [0, 1, 2])
+@pytest.mark.parametrize("iters", [0, 1, 2])
 class TestIters:
     """
     Tests that the results from the Python implementation do not change.
     """
+
     this_path = os.path.dirname(os.path.realpath(__file__))
 
     def read_image(self, filename):
@@ -23,9 +24,9 @@ class TestIters:
         return EdgePixel.load(os.path.join(self.this_path, filename))
 
     def test_iters(self, iters):
-        test_edges = self.read_edges(f'data/lena_{iters}.npz')
+        test_edges = self.read_edges(f"data/lena_{iters}.npz")
 
-        img_gray = self.read_image('images/lena.png')
+        img_gray = self.read_image("images/lena.png")
         edges = subpixel_edges(img_gray, 25, iters, 2)
 
         assert np.allclose(edges.position, test_edges.position)

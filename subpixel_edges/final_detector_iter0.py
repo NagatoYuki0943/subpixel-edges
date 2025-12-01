@@ -1,96 +1,131 @@
 import numpy as np
-
 from subpixel_edges.edgepixel import EdgePixel
 from subpixel_edges.edges_iter0 import h_edges, v_edges
 
 
-def main_iter0(F, threshold, iters, order):
+def main_iter0(image: np.ndarray, threshold: int | float, order: int):
+    # initialization
     ep = EdgePixel()
+    rows, cols = image.shape[:2]  # [30, 30]
+    x, y = np.meshgrid(np.arange(cols), np.arange(rows))
 
-    rows, cols = np.shape(F)
-    [x, y] = np.meshgrid(np.arange(cols), np.arange(rows))
+    # 梯度计算
+    Gx = np.zeros((rows, cols))  # Gx用来存储图像在x方向上的梯度.  [30, 30]
+    # 计算Gx中除了边缘外所有像素在x方向上的梯度. 使用的是简单的一阶差分近似. 通过切片操作, 对 image 进行了边界处理, 避免了越界错误
+    Gx[:, 1:-1] = 0.5 * (image[:, 2:] - image[:, :-2])
+    Gy = np.zeros((rows, cols))  # Gy用来存储图像在y方向上的梯度.  [30, 30]
+    # 计算Gy中除了边缘外所有像素在y方向上的梯度. 使用的是简单的一阶差分近似. 通过切片操作, 对image image进行了边界处理, 避免了越界错误
+    Gy[1:-1, :] = 0.5 * (image[2:, :] - image[:-2, :])
+    grad = np.sqrt(Gx**2 + Gy**2)  # 计算了每个像素点的梯度幅值.     [30, 30]
 
-    Fx = np.zeros((rows, cols))
-    Fx[0: rows, 1: cols - 1] = 0.5 * (F[0: rows, 2: cols] - F[0: rows, 0: cols - 2])
-    Fy = np.zeros((rows, cols))
-    Fy[1: rows - 1, 0: cols] = 0.5 * (F[2: rows, 0: cols] - F[0: rows - 2, 0: cols])
-    grad = np.sqrt(Fx ** 2 + Fy ** 2)
+    # 取梯度的绝对值, 忽略梯度的方向（正负）, 只关注梯度的大小, 忽略边缘
+    absGyInner = np.abs(Gy[5:-5, 2:-2])  # [20, 26] 上下少
+    absGxInner = np.abs(Gx[2:-2, 5:-5])  # [26, 20] 左右少
 
-    abs_Fy_inner = np.abs(Fy[5:rows - 5, 2: cols - 2])
-    abs_Fx_inner = np.abs(Fx[2:rows - 2, 5: cols - 5])
+    # 初始化了两个布尔类型的二维数组 Ey 和 Ex, 它们用于标记图像在 y 和 x 方向上的边缘位置
+    Ey = np.zeros((rows, cols), dtype=bool)  # [30, 30]
+    Ex = np.zeros((rows, cols), dtype=bool)  # [30, 30]
 
-    Ey = np.zeros((rows, cols), dtype=np.bool)
-    Ex = np.zeros((rows, cols), dtype=np.bool)
+    # 使用 np.logical_and.reduce 来逻辑与多个条件, 设置Ey数组中对应位置的值为True, 如果这些条件同时满足:
+    #   - 当前像素的梯度幅值 grad 大于某个阈值 threshold
+    #   - 在 y 方向上的梯度分量的绝对值 absGyInner 大于或等于同一行上x方向梯度分量的绝对值 np.abs(Gx)
+    #   - absGyInner 大于或等于该行上面一行和下面一行的 Gy 梯度分量的绝对值
+    Ey[5:-5, 2:-2] = np.logical_and.reduce(
+        [
+            grad[5:-5, 2:-2] > threshold,
+            absGyInner >= np.abs(Gx[5:-5, 2:-2]),
+            absGyInner >= np.abs(Gy[4:-6, 2:-2]),
+            absGyInner >= np.abs(Gy[6:-4, 2:-2]),
+        ]
+    )  # [30, 30] 中的 [20, 26] 有效, 存储的为 True/False, 代表是否为边缘
 
-    Ey[5: rows - 5, 2: cols - 2] = np.logical_and.reduce([
-        grad[5: rows - 5, 2: cols - 2] > threshold,
-        abs_Fy_inner >= np.abs(Fx[5: rows - 5, 2: cols - 2]),
-        abs_Fy_inner >= np.abs(Fy[4: rows - 6, 2: cols - 2]),
-        abs_Fy_inner > np.abs(Fy[6: rows - 4, 2: cols - 2])
-    ])
+    Ex[2:-2, 5:-5] = np.logical_and.reduce(
+        [
+            grad[2:-2, 5:-5] > threshold,
+            absGxInner >= np.abs(Gy[2:-2, 5:-5]),
+            absGxInner >= np.abs(Gx[2:-2, 4:-6]),
+            absGxInner >= np.abs(Gx[2:-2, 6:-4]),
+        ]
+    )  # [30, 30] 中的 [26, 20] 有效, 存储的为 True/False, 代表是否为边缘
 
-    Ex[2: rows - 2, 5: cols - 5] = np.logical_and.reduce([
-        grad[2: rows - 2, 5: cols - 5] > threshold,
-        abs_Fx_inner > np.abs(Fy[2: rows - 2, 5: cols - 5]),
-        abs_Fx_inner >= np.abs(Fx[2: rows - 2, 4: cols - 6]),
-        abs_Fx_inner > np.abs(Fx[2: rows - 2, 6: cols - 4])
-    ])
+    # [rows,cols] -> [rows*cols]
+    # F 代表列优先
+    Ey = Ey.ravel("F")  # [30, 30] -> [900]
+    Ex = Ex.ravel("F")  # [30, 30] -> [900]
+    y = y.ravel("F")  # [30, 30] -> [900]
+    x = x.ravel("F")  # [30, 30] -> [900]
 
-    Ey = Ey.ravel('F')
-    Ex = Ex.ravel('F')
-    y = y.ravel('F')
-    x = x.ravel('F')
+    # 在y和x方向上被检测为边缘的像素的位置. 由于图像是二维的, 每个边缘点的位置可以用行和列的索引来表示
+    # 这里通过(x[Ey] * rows + y[Ey])计算出y方向上的边缘点的索引, 同理计算x方向上的边缘点的索引
+    # [27] 27 个边缘点,递增的 index 索引, y方向的梯度找到的是水平方向的边缘
+    h_edges_ = x[Ey] * rows + y[Ey]
+    # [28] 28 个边缘点,递增的 index 索引, x方向的梯度找到的是竖直方向的边缘
+    v_edges_ = x[Ex] * rows + y[Ex]
 
-    edges_y = (x[Ey] * rows + y[Ey])
-    edges_x = (x[Ex] * rows + y[Ex])
+    image_flatten = image.ravel("F")  # 原图 [30, 30] -> [900]
+    Gx = Gx.ravel("F")  # x 方向梯度 [30, 30] -> [900]
+    Gy = Gy.ravel("F")  # y 方向梯度 [30, 30] -> [900]
 
-    F = F.ravel('F')
-    Fx = Fx.ravel('F')
-    Fy = Fy.ravel('F')
+    # 计算得到的边缘梯度值存储到 h_A 和 h_B 数组中
+    # 以及他们的多项式系数
+    # all shape: [27]
+    h_pixel_x, h_pixel_y, h_x, h_y, h_nx, h_ny, h_curv, h_i0, h_i1 = h_edges(
+        image_flatten,
+        Gx,
+        Gy,
+        x,
+        y,
+        h_edges_,
+        rows,
+        order,
+    )
 
-    ny = np.ones((np.shape(edges_y)[0], 1))
-    ny[Fy[edges_y] < 0] = -1
-    nx = np.ones((np.shape(edges_x)[0], 1))
-    nx[Fx[edges_x] < 0] = -1
+    # all shape: [28]
+    v_pixel_x, v_pixel_y, v_x, v_y, v_nx, v_ny, v_curv, v_i0, v_i1 = v_edges(
+        image_flatten,
+        Gx,
+        Gy,
+        x,
+        y,
+        v_edges_,
+        rows,
+        order,
+    )
 
-    Ay, By, ay, by, cy = h_edges(F, rows, Fx, Fy, edges_y, order)
-    Ax, Bx, ax, bx, cx = v_edges(F, rows, Fx, Fy, edges_x, order)
+    # all shape: [27+28]
+    # 边缘像素位置
+    ep.pixel_x = np.concatenate((h_pixel_x, v_pixel_x), axis=0)
+    ep.pixel_y = np.concatenate((h_pixel_y, v_pixel_y), axis=0)
+    # 边缘亚像素位置
+    ep.x = np.concatenate((h_x, v_x), axis=0)
+    ep.y = np.concatenate((h_y, v_y), axis=0)
+    # 边缘方向
+    ep.nx = np.concatenate((h_nx, v_nx), axis=0)
+    ep.ny = np.concatenate((h_ny, v_ny), axis=0)
+    # 边缘像素位置 1D index inside image
+    ep.position = np.concatenate((h_edges_, v_edges_), axis=0)
+    # 边缘曲率
+    ep.curv = np.concatenate((h_curv, v_curv), axis=0)
+    # intensities
+    ep.i0 = np.concatenate((h_i0, v_i0), axis=0)
+    ep.i1 = np.concatenate((h_i1, v_i1), axis=0)
 
-    ay = ay.ravel('F')
-    ax = ax.ravel('F')
-
-    ep.position = np.r_[edges_y, edges_x]
-    ep.x = np.r_[x[edges_y], x[edges_x] - ax]
-    ep.y = np.r_[y[edges_y] - ay, y[edges_x]]
-
-    ep.nx = np.r_[
-        np.sign(Ay - By) / np.sqrt(1 + by ** 2) * by,
-        np.sign(Ax - Bx) / np.sqrt(1 + bx ** 2),
-    ]
-    ep.ny = np.r_[
-        np.sign(Ay - By) / np.sqrt(1 + by ** 2),
-        np.sign(Ax - Bx) / np.sqrt(1 + bx ** 2) * bx,
-    ]
-    ep.curv = np.r_[
-        2 * cy * ny / ((1 + by ** 2) ** 1.5),
-        2 * cx * nx / ((1 + bx ** 2) ** 1.5),
-    ]
-    ep.i0 = np.r_[np.minimum(Ay, By), np.minimum(Ax, Bx)]
-    ep.i1 = np.r_[np.maximum(Ay, By), np.maximum(Ax, Bx)]
-
-    # # erase elements outside the image size
+    # 这些行代码首先找出那些 x 或 y 坐标超出图像边界的边缘点索引, 然后使用 np.delete 函数删除这些边缘点的所有相关信息, 确保只保留图像边界内的边缘点
+    # erase elements outside the image size
+    # union1d: 并集
     index_to_erase1 = np.union1d(np.where(ep.x > cols), np.where(ep.y > rows))
     index_to_erase2 = np.union1d(np.where(ep.x < 0), np.where(ep.y < 0))
-    
     index_to_erase = np.union1d(index_to_erase1, index_to_erase2)
-    
+
     ep.x = np.delete(ep.x, index_to_erase)
     ep.y = np.delete(ep.y, index_to_erase)
+    ep.pixel_x = np.delete(ep.pixel_x, index_to_erase)
+    ep.pixel_y = np.delete(ep.pixel_y, index_to_erase)
     ep.nx = np.delete(ep.nx, index_to_erase)
     ep.ny = np.delete(ep.ny, index_to_erase)
-    ep.i0 = np.delete(ep.i0, index_to_erase)
-    ep.i1 = np.delete(ep.i1, index_to_erase)
     ep.position = np.delete(ep.position, index_to_erase)
     ep.curv = np.delete(ep.curv, index_to_erase)
+    ep.i0 = np.delete(ep.i0, index_to_erase)
+    ep.i1 = np.delete(ep.i1, index_to_erase)
 
-    return ep
+    return ep, grad, absGxInner, absGyInner

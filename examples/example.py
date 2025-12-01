@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
@@ -8,11 +9,10 @@ from time import time
 from subpixel_edges import init, subpixel_edges
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     this_path = os.path.dirname(os.path.realpath(__file__))
-    # img = cv2.imread(os.path.join(this_path, 'images/lena.png'))
-    img = cv2.imread(os.path.join(this_path, 'images/ring_noise.tif'))
-    img_gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype(float)
+    img = cv2.imread(os.path.join(this_path, "images/circle2.png"))
+    img_gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).astype(np.float64)
 
     iters = 2
     threshold = 25
@@ -26,7 +26,7 @@ if __name__ == '__main__':
 
     print("Processing...")
     now = time()
-    edges = subpixel_edges(img_gray, threshold, iters, order)
+    edges, grad, absGxInner, absGyInner = subpixel_edges(img_gray, threshold, iters, order)
     elapsed = time() - now
     print("Processing time: ", elapsed)
 
